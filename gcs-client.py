@@ -18,7 +18,7 @@ class GraphCounts:
 
 def list_html_blobs(bucket_name: str) -> List[storage.Blob]:
     """List blobs under prefix and return those that look like numeric *.html files."""
-    client = storage.Client()
+    client = storage.Client.create_anonymous_client()
     blobs = list(client.list_blobs(bucket_name))
 
     html_blobs = []
