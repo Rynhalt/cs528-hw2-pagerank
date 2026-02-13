@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
 from google.cloud import storage
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Matches href="123.html" or href='123.html' with optional spaces; case-insensitive
 LINK_RE = re.compile(r'href\s*=\s*["\']\s*(\d+)\.html\s*["\']', re.IGNORECASE)
@@ -15,6 +16,13 @@ class GraphCounts:
     out_counts: List[int]
     in_counts: List[int]
 
+def _download_and_extract(bucket_name: str, blob):
+    raw = blob.download_as_bytes()
+    text = raw.decode("utf-8", errors="ignore")
+    fname = blob.name.split("/")[-1]
+    src = int(fname[:-5])
+    targets = extract_outgoing_targets(text)
+    return src, targets
 
 def list_html_blobs(bucket_name: str) -> List[storage.Blob]:
     """List blobs under prefix and return those that look like numeric *.html files."""
@@ -53,11 +61,17 @@ def load_link_counts_from_gcs(
     bucket_name: str,
     expected_n: Optional[int] = None,
     max_files: Optional[int] = None,
+    workers: int = 32,
+    progress_every: int = 500,
 ) -> GraphCounts:
     """
     Reads HTML pages from GCS, computes outgoing and incoming link counts.
+    Uses a thread pool to overlap network downloads.
+
     - expected_n: if provided, arrays are sized to this; out-of-range links ignored.
     - max_files: debug option to only read first K files.
+    - workers: number of concurrent download workers.
+    - progress_every: print progress every N completed files (0 disables).
     """
     blobs = list_html_blobs(bucket_name)
 
@@ -69,21 +83,25 @@ def load_link_counts_from_gcs(
     out_counts = [0] * n
     in_counts = [0] * n
 
-    for b in blobs:
-        fname = b.name.split("/")[-1]
-        src = int(fname[:-5])
-        if src < 0 or src >= n:
-            continue
+    # Submit downloads
+    futures = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for b in blobs:
+            futures.append(ex.submit(_download_and_extract, bucket_name, b))
 
-        raw = b.download_as_bytes()
-        text = raw.decode("utf-8", errors="ignore")
-        targets = extract_outgoing_targets(text)
+        processed = 0
+        for fut in as_completed(futures):
+            # If one download fails, this will raise; you'll see the exception.
+            src, targets = fut.result()
 
-        # Filter to [0, n)
-        filtered = [t for t in targets if 0 <= t < n]
+            if 0 <= src < n:
+                filtered = [t for t in targets if 0 <= t < n]
+                out_counts[src] += len(filtered)
+                for t in filtered:
+                    in_counts[t] += 1
 
-        out_counts[src] += len(filtered)
-        for t in filtered:
-            in_counts[t] += 1
+            processed += 1
+            if progress_every and processed % progress_every == 0:
+                print(f"processed {processed}/{len(blobs)}")
 
     return GraphCounts(n=n, out_counts=out_counts, in_counts=in_counts)
