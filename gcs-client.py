@@ -15,6 +15,7 @@ class GraphCounts:
     n: int
     out_counts: List[int]
     in_counts: List[int]
+    out_links: List[List[int]]
 
 def _download_and_extract(bucket_name: str, blob):
     raw = blob.download_as_bytes()
@@ -56,22 +57,16 @@ def extract_outgoing_targets(html_text: str) -> List[int]:
     """Return list of targets extracted from the HTML text."""
     return [int(m.group(1)) for m in LINK_RE.finditer(html_text)]
 
-
 def load_link_counts_from_gcs(
-    bucket_name: str,
-    expected_n: Optional[int] = None,
-    max_files: Optional[int] = None,
-    workers: int = 32,
-    progress_every: int = 500,
-) -> GraphCounts:
+        bucket_name: str,
+        expected_n: Optional[int] = None,
+        max_files: Optional[int] = None,
+        workers: int = 32,
+        progress_every: int = 500,
+    ) -> GraphCounts:
     """
-    Reads HTML pages from GCS, computes outgoing and incoming link counts.
+    Reads HTML pages from GCS, computes outgoing and incoming link counts, and out_links.
     Uses a thread pool to overlap network downloads.
-
-    - expected_n: if provided, arrays are sized to this; out-of-range links ignored.
-    - max_files: debug option to only read first K files.
-    - workers: number of concurrent download workers.
-    - progress_every: print progress every N completed files (0 disables).
     """
     blobs = list_html_blobs(bucket_name)
 
@@ -82,8 +77,8 @@ def load_link_counts_from_gcs(
 
     out_counts = [0] * n
     in_counts = [0] * n
+    out_links: List[List[int]] = [[] for _ in range(n)]  # <-- build adjacency list
 
-    # Submit downloads
     futures = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for b in blobs:
@@ -91,12 +86,16 @@ def load_link_counts_from_gcs(
 
         processed = 0
         for fut in as_completed(futures):
-            # If one download fails, this will raise; you'll see the exception.
             src, targets = fut.result()
 
             if 0 <= src < n:
                 filtered = [t for t in targets if 0 <= t < n]
-                out_counts[src] += len(filtered)
+
+                # store edges for PageRank
+                out_links[src] = filtered
+
+                # update counts
+                out_counts[src] = len(filtered)
                 for t in filtered:
                     in_counts[t] += 1
 
@@ -104,4 +103,4 @@ def load_link_counts_from_gcs(
             if progress_every and processed % progress_every == 0:
                 print(f"processed {processed}/{len(blobs)}")
 
-    return GraphCounts(n=n, out_counts=out_counts, in_counts=in_counts)
+    return GraphCounts(n=n, out_counts=out_counts, in_counts=in_counts, out_links=out_links)
